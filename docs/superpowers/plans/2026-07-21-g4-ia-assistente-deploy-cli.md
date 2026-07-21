@@ -16,7 +16,8 @@
 - CLI: **sem** dependência de git ou shell scripts; apenas Node + Railway CLI do aluno. Toda saída em pt-BR.
 - Repo GitHub do app: `GuilhermeMReis/G4-IA-Assistente` (tarball `https://codeload.github.com/GuilhermeMReis/G4-IA-Assistente/tar.gz/refs/heads/main`).
 - Nome do pacote npm da CLI: `g4-ia-assistente`, bin `g4-ia-assistente`.
-- Flags da Railway CLI usadas: `init --name`, `add --database postgres`, `add --service app --variables`, `volume add`, `up --service app --detach`, `domain --service app`, `whoami`, `status`. **Verificar com `railway <cmd> --help` na primeira execução real** — se alguma flag tiver mudado, ajustar em `steps.ts` (única fonte).
+- Flags da Railway CLI (verificadas contra a CLI **5.27.2** em 2026-07-21): `init --name`, `add --image pgvector/pgvector:pg17 --service db --variables`, `add --service app --variables`, `service <nome>` (linka o serviço no diretório — **necessário antes de `volume add`**, que só aceita `-m/--mount-path`), `volume add -m`, `up --service app --detach`, `domain --service app`, `whoami`, `status`, `service delete --service <nome> --yes`.
+- **Postgres padrão do Railway (PG18) NÃO tem pgvector** (verificado em projeto real em 2026-07-21). O banco DEVE ser criado com a imagem `pgvector/pgvector:pg17`, volume em `/var/lib/postgresql/data`, variáveis `POSTGRES_PASSWORD/POSTGRES_USER=postgres/POSTGRES_DB=railway/PGDATA=/var/lib/postgresql/data/pgdata`; o app conecta via rede privada `postgresql://postgres:<senha>@db.railway.internal:5432/railway` com senha gerada pela CLI.
 
 ---
 
@@ -138,17 +139,18 @@ docker-compose.yml
 }
 ```
 
-- [ ] **Step 5: Verificar build e execução local**
+- [ ] **Step 5: Verificar build e execução local (opcional — só se houver Docker na máquina)**
 
 ```bash
 docker build -t g4-ia-app .
 docker run --rm -p 3000:3000 \
-  -e DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5432/g4" \
+  -e DATABASE_URL="<TEST_DATABASE_URL do .env (Railway)>" \
   -e AUTH_SECRET=dev -e ENCRYPTION_KEY=$(printf 'a%.0s' {1..64}) \
   -e DATA_DIR=/tmp/data -e AUTH_TRUST_HOST=true \
   g4-ia-app
 ```
 Esperado: log "migrations ok", server no ar; `curl localhost:3000/api/health` → `{"ok":true}`.
+Sem Docker local, a validação definitiva acontece no primeiro deploy real via CLI (Task 20, Step 8) — o Railway builda o Dockerfile na nuvem.
 
 - [ ] **Step 6: Commit** — `git add -A && git commit -m "feat: build de produção com Docker, migrations no boot e healthcheck"`
 
@@ -162,8 +164,8 @@ Esperado: log "migrations ok", server no ar; `curl localhost:3000/api/health` �
 - Produces (todas em `steps.ts`, recebendo `Runner` injetado — testáveis sem Railway):
   - `type Runner = (cmd: string, args: string[], opts?: { cwd?: string }) => Promise<{ code: number; stdout: string; stderr: string }>`
   - `checkRailway(run): Promise<{ ok: true } | { ok: false; motivo: "nao-instalada" | "nao-logada" }>`
-  - `generateSecrets(rand?): { AUTH_SECRET: string; ENCRYPTION_KEY: string }` — base64url 32 bytes / hex 64 chars
-  - `createProject(run, cwd, nome)`, `addDatabase(run, cwd)`, `addAppService(run, cwd, secrets)`, `addVolume(run, cwd)`, `deploy(run, cwd)` — lançam `Error` com stderr quando `code !== 0`
+  - `generateSecrets(rand?): { AUTH_SECRET: string; ENCRYPTION_KEY: string; DB_PASSWORD: string }` — base64url 32 bytes / hex 64 chars / hex 32 chars
+  - `createProject(run, cwd, nome)`, `addDatabase(run, cwd, dbPassword)` (imagem pgvector), `linkService(run, cwd, nome)`, `addVolume(run, cwd, mountPath)` (requer `linkService` antes), `addAppService(run, cwd, secrets)`, `deploy(run, cwd)` — lançam `Error` com stderr quando `code !== 0`
   - `getDomain(run, cwd): Promise<string>` — extrai primeira URL `https://...` do stdout
   - `isLinkedProject(run, cwd): Promise<boolean>` — `railway status` code 0
   - `downloadCode(destDir, opts?: { tarballUrl?, fetchImpl? }): Promise<void>` (em `download.ts`)
@@ -222,7 +224,7 @@ Rodar `npm install` na raiz para linkar o workspace.
 `packages/cli/src/steps.test.ts`:
 ```ts
 import { describe, it, expect } from "vitest";
-import { checkRailway, generateSecrets, createProject, addAppService, getDomain, isLinkedProject } from "./steps";
+import { checkRailway, generateSecrets, createProject, addDatabase, addAppService, getDomain, isLinkedProject } from "./steps";
 
 type Call = { cmd: string; args: string[] };
 
@@ -253,11 +255,23 @@ describe("checkRailway", () => {
 });
 
 describe("generateSecrets", () => {
-  it("gera ENCRYPTION_KEY hex de 64 chars e AUTH_SECRET não-vazio", () => {
+  it("gera ENCRYPTION_KEY hex 64, DB_PASSWORD hex 32 e AUTH_SECRET não-vazio", () => {
     const s = generateSecrets();
     expect(s.ENCRYPTION_KEY).toMatch(/^[0-9a-f]{64}$/);
+    expect(s.DB_PASSWORD).toMatch(/^[0-9a-f]{32}$/);
     expect(s.AUTH_SECRET.length).toBeGreaterThanOrEqual(32);
     expect(generateSecrets().ENCRYPTION_KEY).not.toBe(s.ENCRYPTION_KEY);
+  });
+});
+
+describe("addDatabase", () => {
+  it("cria o serviço db com a imagem pgvector e a senha", async () => {
+    const { run, calls } = fakeRunner({});
+    await addDatabase(run, "/tmp/app", "abc123");
+    const args = calls[0].args.join(" ");
+    expect(args).toContain("add --image pgvector/pgvector:pg17 --service db");
+    expect(args).toContain("POSTGRES_PASSWORD=abc123");
+    expect(args).toContain("PGDATA=/var/lib/postgresql/data/pgdata");
   });
 });
 
@@ -276,12 +290,12 @@ describe("createProject", () => {
 describe("addAppService", () => {
   it("passa todas as variáveis", async () => {
     const { run, calls } = fakeRunner({});
-    await addAppService(run, "/tmp/app", { AUTH_SECRET: "s3", ENCRYPTION_KEY: "e".repeat(64) });
+    await addAppService(run, "/tmp/app", { AUTH_SECRET: "s3", ENCRYPTION_KEY: "e".repeat(64), DB_PASSWORD: "abc123" });
     const args = calls[0].args.join(" ");
     expect(args).toContain("add --service app");
     expect(args).toContain("AUTH_SECRET=s3");
     expect(args).toContain(`ENCRYPTION_KEY=${"e".repeat(64)}`);
-    expect(args).toContain("DATABASE_URL=${{Postgres.DATABASE_URL}}");
+    expect(args).toContain("DATABASE_URL=postgresql://postgres:abc123@db.railway.internal:5432/railway");
     expect(args).toContain("DATA_DIR=/data");
     expect(args).toContain("AUTH_TRUST_HOST=true");
   });
@@ -352,27 +366,39 @@ export function generateSecrets(rand: (n: number) => Buffer = randomBytes) {
   return {
     AUTH_SECRET: rand(32).toString("base64url"),
     ENCRYPTION_KEY: rand(32).toString("hex"),
+    DB_PASSWORD: rand(16).toString("hex"),
   };
 }
 
 export const createProject = (run: Runner, cwd: string, nome: string) =>
   exec(run, cwd, ["init", "--name", nome], "criar o projeto no Railway");
 
-export const addDatabase = (run: Runner, cwd: string) =>
-  exec(run, cwd, ["add", "--database", "postgres"], "provisionar o Postgres");
+// o template padrão de Postgres do Railway (PG18) não inclui pgvector — usamos a imagem oficial pgvector
+export const addDatabase = (run: Runner, cwd: string, dbPassword: string) =>
+  exec(run, cwd, [
+    "add", "--image", "pgvector/pgvector:pg17", "--service", "db",
+    "--variables", `POSTGRES_PASSWORD=${dbPassword}`,
+    "--variables", "POSTGRES_USER=postgres",
+    "--variables", "POSTGRES_DB=railway",
+    "--variables", "PGDATA=/var/lib/postgresql/data/pgdata",
+  ], "provisionar o Postgres (pgvector)");
 
-export const addAppService = (run: Runner, cwd: string, secrets: { AUTH_SECRET: string; ENCRYPTION_KEY: string }) =>
+export const linkService = (run: Runner, cwd: string, nome: string) =>
+  exec(run, cwd, ["service", nome], `selecionar o serviço ${nome}`);
+
+export const addAppService = (run: Runner, cwd: string, secrets: { AUTH_SECRET: string; ENCRYPTION_KEY: string; DB_PASSWORD: string }) =>
   exec(run, cwd, [
     "add", "--service", "app",
     "--variables", `AUTH_SECRET=${secrets.AUTH_SECRET}`,
     "--variables", `ENCRYPTION_KEY=${secrets.ENCRYPTION_KEY}`,
-    "--variables", "DATABASE_URL=${{Postgres.DATABASE_URL}}",
+    "--variables", `DATABASE_URL=postgresql://postgres:${secrets.DB_PASSWORD}@db.railway.internal:5432/railway`,
     "--variables", "DATA_DIR=/data",
     "--variables", "AUTH_TRUST_HOST=true",
   ], "criar o serviço do app");
 
-export const addVolume = (run: Runner, cwd: string) =>
-  exec(run, cwd, ["volume", "add", "--mount-path", "/data", "--service", "app"], "anexar o volume de dados");
+// pré-requisito: linkService() para o serviço dono do volume — `volume add` não tem flag --service na CLI 5.27
+export const addVolume = (run: Runner, cwd: string, mountPath: string) =>
+  exec(run, cwd, ["volume", "add", "-m", mountPath], `anexar o volume em ${mountPath}`);
 
 export const deploy = (run: Runner, cwd: string) =>
   exec(run, cwd, ["up", "--service", "app", "--detach"], "fazer o deploy");
@@ -461,7 +487,7 @@ import path from "path";
 import os from "os";
 import open from "open";
 import { run } from "./runner.js";
-import { checkRailway, generateSecrets, createProject, addDatabase, addAppService, addVolume, deploy, getDomain, isLinkedProject } from "./steps.js";
+import { checkRailway, generateSecrets, createProject, addDatabase, linkService, addAppService, addVolume, deploy, getDomain, isLinkedProject } from "./steps.js";
 import { downloadCode } from "./download.js";
 
 const dourado = (s: string) => pc.bold(pc.yellow(s));
@@ -513,16 +539,21 @@ async function main() {
   await createProject(run, appDir, nome);
   s.stop("Projeto criado");
 
-  s.start("Provisionando o banco Postgres");
-  await addDatabase(run, appDir);
+  const secrets = generateSecrets();
+
+  s.start("Provisionando o banco Postgres (pgvector)");
+  await addDatabase(run, appDir, secrets.DB_PASSWORD);
+  await linkService(run, appDir, "db");
+  await addVolume(run, appDir, "/var/lib/postgresql/data");
   s.stop("Postgres provisionado");
 
   s.start("Gerando chaves de segurança e configurando o serviço");
-  await addAppService(run, appDir, generateSecrets());
+  await addAppService(run, appDir, secrets);
   s.stop("Serviço configurado");
 
   s.start("Anexando volume de arquivos");
-  await addVolume(run, appDir);
+  await linkService(run, appDir, "app");
+  await addVolume(run, appDir, "/data");
   s.stop("Volume anexado");
 
   s.start("Fazendo o deploy (isso pode levar alguns minutos)");
@@ -560,153 +591,27 @@ Teste real completo (opcional, requer conta Railway): `railway login` e rodar `n
 
 - [ ] **Step 10: Commit** — `git add -A && git commit -m "feat: CLI g4-ia-assistente para deploy no Railway do aluno"`
 
-### Task 21: Smoke e2e (Playwright + OpenAI mockada)
+### Task 21: Teste de integração da rota de chat com OpenAI mockada (vitest, sem navegador)
+
+> Decisão do usuário (2026-07-21): priorizar testes unitários/integração em vez de E2E — o smoke Playwright original foi descartado. Este task cobre o caminho crítico (chat streaming + persistência + título) na camada da API, em vitest.
 
 **Files:**
-- Create: `apps/web/playwright.config.ts`, `apps/web/e2e/smoke.spec.ts`, `apps/web/test/mocks/openai-server.mjs`, `apps/web/e2e/global-setup.ts`
-- Verify: o `/api/chat` usa `openai.chat(modelId)` (API de chat completions, já definido na Parte 1, Task 11) — obrigatório para o mock desta task funcionar.
+- Create: `apps/web/test/mocks/openai-server.mjs` (mock HTTP da OpenAI: /v1/models, /v1/embeddings, /v1/chat/completions com SSE — código do plano original), `apps/web/app/api/chat/chat-route.integration.test.ts`
 
 **Interfaces:**
-- Produces: `npm run e2e -w apps/web` — sobe mock OpenAI (porta 8788) + next dev (porta 3100, banco `g4_e2e` migrado) e roda o fluxo setup → chat.
+- Consumes: handler `POST` de `@/app/api/chat/route`, serviços de settings/conversations, helper `getTestDb`.
+- Produces: teste gated por `TEST_DATABASE_URL` que sobe o mock numa porta efêmera e valida o fluxo completo.
 
-- [ ] **Step 1: Instalar** — `cd apps/web && npm i -D @playwright/test && npx playwright install chromium`
-
-- [ ] **Step 2: Mock da OpenAI**
-
-`apps/web/test/mocks/openai-server.mjs`:
-```js
-import http from "http";
-
-const PORT = Number(process.env.MOCK_PORT ?? 8788);
-const RESPOSTA = "Olá! Como posso ajudar o seu negócio hoje?";
-
-function sse(res, chunks) {
-  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-  for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
-  res.write("data: [DONE]\n\n");
-  res.end();
-}
-
-http.createServer((req, res) => {
-  let body = "";
-  req.on("data", (d) => (body += d));
-  req.on("end", () => {
-    if (req.url?.endsWith("/models")) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ object: "list", data: [{ id: "gpt-5-mini", object: "model" }] }));
-    }
-    if (req.url?.endsWith("/embeddings")) {
-      const inputs = [].concat(JSON.parse(body).input);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        object: "list", model: "text-embedding-3-small",
-        data: inputs.map((_, index) => ({ object: "embedding", index, embedding: Array(1536).fill(0.001) })),
-        usage: { prompt_tokens: 1, total_tokens: 1 },
-      }));
-    }
-    if (req.url?.endsWith("/chat/completions")) {
-      const base = { id: "chatcmpl-1", object: "chat.completion.chunk", created: 0, model: "gpt-5-mini" };
-      return sse(res, [
-        { ...base, choices: [{ index: 0, delta: { role: "assistant", content: RESPOSTA }, finish_reason: null }] },
-        { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-      ]);
-    }
-    res.writeHead(404); res.end();
-  });
-}).listen(PORT, () => console.log(`mock openai na porta ${PORT}`));
-```
-
-- [ ] **Step 3: Config e global setup**
-
-`apps/web/e2e/global-setup.ts` — cria/reseta o banco `g4_e2e` e roda migrations:
-```ts
-import { execSync } from "child_process";
-import postgres from "postgres";
-
-export default async function globalSetup() {
-  const admin = postgres("postgres://postgres:postgres@localhost:5432/postgres");
-  await admin.unsafe(`DROP DATABASE IF EXISTS g4_e2e WITH (FORCE)`);
-  await admin.unsafe(`CREATE DATABASE g4_e2e`);
-  await admin.end();
-  execSync("npx drizzle-kit migrate", {
-    cwd: __dirname + "/..",
-    env: { ...process.env, DATABASE_URL: "postgres://postgres:postgres@localhost:5432/g4_e2e" },
-    stdio: "inherit",
-  });
-}
-```
-
-`apps/web/playwright.config.ts`:
-```ts
-import { defineConfig } from "@playwright/test";
-
-const E2E_DB = "postgres://postgres:postgres@localhost:5432/g4_e2e";
-
-export default defineConfig({
-  testDir: "./e2e",
-  globalSetup: "./e2e/global-setup.ts",
-  timeout: 60_000,
-  use: { baseURL: "http://localhost:3100" },
-  webServer: [
-    {
-      command: "node test/mocks/openai-server.mjs",
-      port: 8788,
-      reuseExistingServer: false,
-    },
-    {
-      command: "npx next dev -p 3100",
-      port: 3100,
-      reuseExistingServer: false,
-      env: {
-        DATABASE_URL: E2E_DB,
-        AUTH_SECRET: "e2e-secret",
-        ENCRYPTION_KEY: "f".repeat(64),
-        DATA_DIR: "./.e2e-data",
-        AUTH_TRUST_HOST: "true",
-        OPENAI_BASE_URL: "http://localhost:8788/v1",
-      },
-    },
-  ],
-});
-```
-Adicionar script em `apps/web/package.json`: `"e2e": "playwright test"`.
-
-- [ ] **Step 4: Spec do fluxo completo**
-
-`apps/web/e2e/smoke.spec.ts`:
-```ts
-import { test, expect } from "@playwright/test";
-
-test("setup → chat com streaming", async ({ page }) => {
-  // Wizard de setup
-  await page.goto("/setup");
-  await page.getByLabel("Seu nome").fill("Admin E2E");
-  await page.getByLabel("E-mail").fill("admin@e2e.com");
-  await page.getByLabel(/Senha/).fill("senha-e2e-123");
-  await page.getByRole("button", { name: "Continuar" }).click();
-
-  await page.getByLabel("Chave da OpenAI").fill("sk-e2e-fake");
-  await page.getByRole("button", { name: "Continuar" }).click();
-
-  await page.getByRole("button", { name: "Concluir" }).click();
-
-  // Logado e no chat
-  await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
-
-  // Envia mensagem e recebe resposta mockada com streaming
-  await page.getByPlaceholder("Envie uma mensagem...").fill("Olá, G4!");
-  await page.keyboard.press("Enter");
-  await expect(page.getByText("Olá! Como posso ajudar o seu negócio hoje?")).toBeVisible({ timeout: 20_000 });
-
-  // Conversa aparece na sidebar após refresh
-  await page.reload();
-  await expect(page.getByText("Olá! Como posso ajudar o seu negócio hoje?")).toBeVisible();
-});
-```
-
-- [ ] **Step 5: Rodar** — `docker compose up -d db && npm run e2e -w apps/web` → esperado: 1 passed. Ajustar seletores conforme a UI real se algum falhar (rodar com `--ui` para depurar).
-
-- [ ] **Step 6: Commit** — `git add -A && git commit -m "test: smoke e2e do fluxo setup → chat com OpenAI mockada"`
+- [ ] **Step 1: Mock server** — implementar `openai-server.mjs` exportando `startMockOpenAI(port?) => Promise<{ url, close }>` (server http nativo; SSE com resposta fixa "Olá! Como posso ajudar o seu negócio hoje?"; embeddings 1536 dims; /v1/models 200).
+- [ ] **Step 2: Teste de integração (RED primeiro)** — `chat-route.integration.test.ts`:
+  - `vi.mock("@/lib/auth")` para `auth()` retornar sessão de um usuário seedado;
+  - seed no g4_test: user, settings com chave criptografada (ENCRYPTION_KEY de teste) e defaultModel, conversation do user;
+  - `process.env.OPENAI_BASE_URL = url + "/v1"` do mock;
+  - chamar `POST(new Request("http://test/api/chat", { method: "POST", body: JSON.stringify({ messages: [msg de texto UIMessage], conversationId }) }))`;
+  - ler o stream da Response até o fim e afirmar que o texto mockado aparece;
+  - afirmar persistência: 2 mensagens na conversa; título definido (≠ null).
+- [ ] **Step 3: GREEN** — rodar `npx vitest run app/api/chat` até passar; ajustar apenas o teste (a rota já está pronta; se a rota tiver bug real, reportar como finding em vez de contornar).
+- [ ] **Step 4: Commit** — `git add -A && git commit -m "test: integração da rota de chat com OpenAI mockada"`
 
 ### Task 22: Documentação final
 

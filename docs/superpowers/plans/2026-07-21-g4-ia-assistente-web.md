@@ -22,7 +22,7 @@
 - Env vars: `DATABASE_URL`, `AUTH_SECRET`, `ENCRYPTION_KEY` (64 hex chars), `DATA_DIR`, `AUTH_TRUST_HOST=true`, `OPENAI_BASE_URL` (opcional, só para testes/mocks).
 - Convites: expiração 7 dias, uso único. Roles: `admin` | `member`.
 - RAG: chunks ~1800 chars (≈500 tokens) com overlap 200; top-K=8; threshold similaridade 0.25.
-- Testes de integração com banco: gated por `TEST_DATABASE_URL` (usar `describe.skipIf(!process.env.TEST_DATABASE_URL)`); rodam contra Postgres pgvector do docker-compose.
+- Testes de integração com banco: gated por `TEST_DATABASE_URL` (usar `describe.skipIf(!process.env.TEST_DATABASE_URL)`); rodam contra o Postgres de desenvolvimento hospedado no Railway (sem Docker local — decisão do usuário). O `vitest.config.ts` carrega `apps/web/.env` via `process.loadEnvFile`, então `npx vitest run` funciona sem prefixos.
 - Commits frequentes, mensagens em português, prefixos `feat:/fix:/test:/docs:/chore:`.
 - Repo: `/Users/guilhermereis/Projects/G4/G4-IA-Assistente` (branch `main`).
 
@@ -131,28 +131,14 @@ npx create-next-app@latest apps/web --ts --tailwind --eslint --app --no-src-dir 
 ```
 Depois editar `apps/web/package.json`: `"name": "web"`. Remover `apps/web/.git` se criado, e `apps/web/package-lock.json` (lock fica na raiz).
 
-- [ ] **Step 3: docker-compose para dev**
+- [ ] **Step 3: Banco de desenvolvimento (Railway, sem Docker)**
 
-`docker-compose.yml` (raiz):
-```yaml
-services:
-  db:
-    image: pgvector/pgvector:pg17
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: g4
-    ports: ["5432:5432"]
-    volumes: [dbdata:/var/lib/postgresql/data]
-volumes:
-  dbdata:
-```
+Não há Docker local. O banco de dev é um Postgres com pgvector num projeto Railway de desenvolvimento, acessado pelo TCP proxy público. As URLs (`DATABASE_URL`/`TEST_DATABASE_URL`) ficam em `apps/web/.env` (Task 3) — o controlador fornece os valores reais.
 
 - [ ] **Step 4: Instalar e verificar build**
 
 ```bash
 npm install
-docker compose up -d db
 npm run build
 ```
 Esperado: build do Next.js conclui sem erros.
@@ -397,10 +383,11 @@ export default defineConfig({
 });
 ```
 
-`apps/web/.env.example` (copiar para `.env` com os mesmos valores para dev):
+`apps/web/.env.example` (copiar para `.env`; as URLs reais do Postgres de dev no Railway são fornecidas pelo controlador):
 ```
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/g4
-TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/g4_test
+# Postgres de desenvolvimento (projeto Railway de dev — TCP proxy público)
+DATABASE_URL=postgresql://postgres:SENHA@HOST.proxy.rlwy.net:PORTA/railway
+TEST_DATABASE_URL=postgresql://postgres:SENHA@HOST.proxy.rlwy.net:PORTA/g4_test
 AUTH_SECRET=dev-secret-troque-em-producao
 ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
 DATA_DIR=./data
@@ -421,16 +408,21 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 ```bash
 cd apps/web && npx drizzle-kit migrate
-docker compose exec db psql -U postgres -d g4 -c "\dt"
+psql "$DATABASE_URL" -c "\dt"
 ```
-Esperado: as 8 tabelas listadas.
+Esperado: as 8 tabelas listadas. (`drizzle-kit` lê o `.env` automaticamente; para o psql, exporte `DATABASE_URL` do `.env` antes.)
 
 - [ ] **Step 5: Helper de teste + vitest config**
 
 `apps/web/vitest.config.ts`:
 ```ts
 import { defineConfig } from "vitest/config";
+import { existsSync } from "fs";
 import path from "path";
+
+// carrega o .env local (URLs do Postgres de dev no Railway) para os testes
+const envFile = path.resolve(__dirname, ".env");
+if (existsSync(envFile)) process.loadEnvFile(envFile);
 
 export default defineConfig({
   test: { environment: "node", include: ["lib/**/*.test.ts", "test/**/*.test.ts"] },
@@ -490,7 +482,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)("schema", () => {
   });
 });
 ```
-Rodar: `TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/g4_test npx vitest run lib/db` — esperado: PASS.
+Rodar: `npx vitest run lib/db` (o vitest.config carrega o `.env` com `TEST_DATABASE_URL`) — esperado: PASS.
 
 - [ ] **Step 7: Commit**
 
@@ -820,6 +812,7 @@ export const authConfig = {
       const { pathname } = request.nextUrl;
       const publica = ["/login", "/setup"].some((p) => pathname.startsWith(p))
         || pathname.startsWith("/invite/")
+        || pathname.startsWith("/api/auth")      // endpoints internos do NextAuth (csrf/session/callback)
         || pathname.startsWith("/api/setup")
         || pathname.startsWith("/api/invites/accept")
         || pathname.startsWith("/api/health")
@@ -828,12 +821,12 @@ export const authConfig = {
       return Boolean(auth?.user);
     },
     jwt({ token, user }) {
-      if (user) { token.id = (user as any).id; token.role = (user as any).role; }
+      if (user) { token.id = user.id; token.role = user.role; }
       return token;
     },
     session({ session, token }) {
       session.user.id = token.id as string;
-      (session.user as any).role = token.role as "admin" | "member";
+      session.user.role = token.role as "admin" | "member";
       return session;
     },
   },
@@ -1236,7 +1229,7 @@ if (!(await isSetupCompleted(db))) redirect("/setup");
 - [ ] **Step 7: Verificação manual**
 
 ```bash
-docker compose up -d db && npm run dev -w apps/web
+npm run dev -w apps/web
 ```
 Abrir http://localhost:3000 → deve redirecionar (via layout futuro; por ora acessar /setup direto), completar wizard com chave real ou `OPENAI_BASE_URL` mockada; conferir linha em `settings` e usuário admin no banco.
 
