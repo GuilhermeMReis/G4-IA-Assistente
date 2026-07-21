@@ -33,4 +33,19 @@ describe("chunkText", () => {
     expect(chunks.length).toBeGreaterThan(1);
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(300);
   });
+
+  it("hard-split preserva overlap real entre chunks consecutivos (texto longo sem pontuação)", () => {
+    // Tokens distintos (não repetitivos) para que uma substring compartilhada só possa
+    // existir por causa do overlap de verdade — não por coincidência de padrão repetido
+    // (ex.: "palavra ".repeat(n) teria falso positivo mesmo com o overlap zerado).
+    const text = Array.from({ length: 3000 }, (_, i) => `palavra${i}`).join(" ");
+    const chunks = chunkText(text, { maxChars: 300, overlap: 50 });
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(300);
+    for (let i = 1; i < chunks.length; i++) {
+      const head = chunks[i].slice(0, 30);
+      expect(head.length).toBe(30);
+      expect(chunks[i - 1].includes(head)).toBe(true);
+    }
+  });
 });
